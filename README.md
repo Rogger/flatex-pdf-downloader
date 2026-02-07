@@ -55,3 +55,11 @@ python flatex_pdf_downloader.py \
   --retries 5 \
   --skip-existing
 ```
+
+## Disclaimer
+
+Use at your own risk. This project is provided "as is", without warranty of any kind.
+
+## License
+
+MIT. See `LICENSE`.
