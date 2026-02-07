@@ -1,8 +1,8 @@
+# flatex pdf downloader
+
 This project automates downloading Flatex document-archive PDFs with retries, resume support, and skip-existing logic.
 
 [![CI](https://github.com/Rogger/flatex-pdf-downloader/actions/workflows/ci.yml/badge.svg)](https://github.com/Rogger/flatex-pdf-downloader/actions/workflows/ci.yml)
-
-Python script that mirrors the Flatex Downloader extension flow for the classic document archive.
 
 ## How it works
 
