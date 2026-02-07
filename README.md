@@ -1,4 +1,6 @@
-# Flatex PDF Downloader
+# flatex-pdf-downloader
+
+[![CI](https://github.com/Rogger/flatex-pdf-downloader/actions/workflows/ci.yml/badge.svg)](https://github.com/Rogger/flatex-pdf-downloader/actions/workflows/ci.yml)
 
 Python script that mirrors the Flatex Downloader extension flow for the classic document archive.
 
@@ -63,3 +65,10 @@ Use at your own risk. This project is provided "as is", without warranty of any 
 ## License
 
 MIT. See `LICENSE`.
+
+## Testing
+
+```bash
+source .venv/bin/activate
+python -m pytest -q
+```

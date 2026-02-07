@@ -1,33 +1,24 @@
 #!/usr/bin/env python3
-"""Batch PDF downloader for Flatex document archive (classic flow).
-
-This script mirrors the browser extension approach:
-- read rows + filter state from archive page,
-- read internal credentials (tokenId/windowId) from page context,
-- POST selected row index with Flatex AJAX headers,
-- parse execute-command script for PDF URL,
-- fetch PDFs with session cookies, with 503 warm-up fallback.
-"""
+"""Batch PDF downloader for Flatex document archive (classic flow)."""
 
 from __future__ import annotations
 
 import argparse
-import hashlib
-import re
+import json
+import logging
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
-from playwright.sync_api import BrowserContext, Page, Response, sync_playwright
+from playwright.sync_api import Page, sync_playwright
+
+from src.download import save_pdf_from_link
+from src.parse_utils import extract_pdf_link_from_script
 
 ROW_SELECTOR = 'tr[onclick^="DocumentViewer.openPopupIfRequired"]'
-SCRIPT_PATTERNS = [
-    re.compile(r'finished\("([^\"]+)",'),
-    re.compile(r'display\("([^\"]+)",'),
-]
-FILENAME_RE = re.compile(r"filename\*?=(?:UTF-8''|\")?([^\";]+)", re.IGNORECASE)
+
+logger = logging.getLogger("flatex-pdf-downloader")
 
 
 class FlatexError(RuntimeError):
@@ -45,71 +36,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--end-row", type=int, default=0, help="1-based row index to end at (0 = all)")
     parser.add_argument("--skip-existing", action="store_true", help="Skip file if it already exists")
     parser.add_argument("--headless", action="store_true", help="Run headless")
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Logging verbosity",
+    )
+    parser.add_argument(
+        "--report-file",
+        default="run_report.json",
+        help="JSON summary filename written into output-dir",
+    )
     return parser.parse_args()
 
 
-def sanitize_filename(name: str) -> str:
-    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", name.strip())
-    safe = safe.strip("._")
-    return safe or "document.pdf"
-
-
-def filename_from_headers_or_url(response: Response, url: str, fallback_stem: str) -> str:
-    content_disp = response.headers.get("content-disposition", "")
-    match = FILENAME_RE.search(content_disp)
-    if match:
-        candidate = unquote(match.group(1)).strip()
-        if candidate:
-            if not candidate.lower().endswith(".pdf"):
-                candidate += ".pdf"
-            return sanitize_filename(candidate)
-
-    parsed = urlparse(url)
-    qs = parse_qs(parsed.query)
-    for key in ("filename", "file", "name", "documentName", "id"):
-        if key in qs and qs[key]:
-            candidate = unquote(qs[key][0])
-            if not candidate.lower().endswith(".pdf"):
-                candidate += ".pdf"
-            return sanitize_filename(candidate)
-
-    tail = Path(parsed.path).name
-    if tail:
-        if not tail.lower().endswith(".pdf"):
-            tail += ".pdf"
-        return sanitize_filename(unquote(tail))
-
-    return sanitize_filename(f"{fallback_stem}.pdf")
-
-
-def filename_from_url(url: str, fallback_stem: str) -> str:
-    parsed = urlparse(url)
-    qs = parse_qs(parsed.query)
-    for key in ("filename", "file", "name", "documentName", "id"):
-        if key in qs and qs[key]:
-            candidate = unquote(qs[key][0]).strip()
-            if candidate:
-                if not candidate.lower().endswith(".pdf"):
-                    candidate += ".pdf"
-                return sanitize_filename(candidate)
-
-    tail = Path(parsed.path).name
-    if tail:
-        if not tail.lower().endswith(".pdf"):
-            tail += ".pdf"
-        return sanitize_filename(unquote(tail))
-
-    return sanitize_filename(f"{fallback_stem}.pdf")
-
-
-def build_stable_stem(url: str) -> str:
-    parsed = urlparse(url)
-    qs = parse_qs(parsed.query)
-    for key in ("id", "documentId", "docId", "mailingId", "uuid"):
-        if key in qs and qs[key]:
-            return f"flatex_{sanitize_filename(qs[key][0])}"
-    digest = hashlib.sha1(url.encode("utf-8")).hexdigest()[:12]
-    return f"flatex_{digest}"
+def configure_logging(level: str) -> None:
+    logging.basicConfig(level=getattr(logging, level), format="%(asctime)s %(levelname)s %(message)s")
 
 
 def get_archive_state(page: Page) -> dict:
@@ -171,19 +113,6 @@ def wait_for_user_ready() -> None:
     print("3) Apply filters")
     print("4) Scroll until all rows are visible")
     input("Press ENTER to start batch download... ")
-
-
-def normalize_command_url(url: str, base_url: str) -> str:
-    url = url.replace("\\/", "/").replace("\\u0026", "&")
-    return urljoin(base_url, url)
-
-
-def extract_pdf_link_from_script(script: str, base_url: str) -> str:
-    for pattern in SCRIPT_PATTERNS:
-        match = pattern.search(script)
-        if match:
-            return normalize_command_url(match.group(1), base_url)
-    raise FlatexError("command-invalid: no PDF link pattern matched")
 
 
 def fetch_row_command(page: Page, token_id: str, window_id: str, form_data: dict[str, str], row_index: int) -> dict:
@@ -255,100 +184,28 @@ def get_row_pdf_link(page: Page, state: dict, row_index: int) -> str:
     if not isinstance(execute, dict) or not isinstance(execute.get("script"), str):
         raise FlatexError(f"row {row_index}: execute command missing")
 
-    return extract_pdf_link_from_script(execute["script"], state["pageUrl"])
-
-
-def warmup_pdf_link(page: Page, link: str) -> None:
-    page.evaluate(
-        """
-        async (url) => {
-          const frame = document.createElement('iframe');
-          frame.style.visibility = 'hidden';
-          frame.style.opacity = '0';
-          frame.style.width = '0';
-          frame.style.height = '0';
-
-          await new Promise((resolve, reject) => {
-            const t = window.setTimeout(() => reject(new Error('iframe-timeout')), 30000);
-            frame.addEventListener('load', () => {
-              window.clearTimeout(t);
-              resolve(null);
-            }, { once: true });
-            frame.src = url;
-            document.body.appendChild(frame);
-          });
-
-          await new Promise((resolve) => setTimeout(resolve, 5000));
-          frame.remove();
-        }
-        """,
-        link,
-    )
-
-
-def fetch_pdf_response(context: BrowserContext, link: str, timeout_s: int) -> Response:
-    return context.request.get(link, timeout=timeout_s * 1000)
-
-
-def save_pdf_from_link(
-    context: BrowserContext,
-    page: Page,
-    link: str,
-    output_dir: Path,
-    timeout_s: int,
-    skip_existing: bool,
-) -> tuple[bool, str, bool]:
-    stem = build_stable_stem(link)
-    if skip_existing:
-        optimistic_name = filename_from_url(link, stem)
-        optimistic_target = output_dir / optimistic_name
-        if optimistic_target.exists():
-            return True, f"skipped existing {optimistic_target.name}", False
-
     try:
-        response = fetch_pdf_response(context, link, timeout_s)
-    except Exception as exc:
-        return False, f"request failed: {exc}", True
+        return extract_pdf_link_from_script(execute["script"], state["pageUrl"])
+    except RuntimeError as exc:
+        raise FlatexError(str(exc)) from exc
 
-    if response.status == 503:
-        try:
-            warmup_pdf_link(page, link)
-            response = fetch_pdf_response(context, link, timeout_s)
-        except Exception as exc:
-            return False, f"503 warm-up failed: {exc}", True
 
-    if not response.ok:
-        return False, f"HTTP {response.status}", response.status in (429, 500, 502, 503, 504)
-
-    body = response.body()
-    ctype = response.headers.get("content-type", "").lower()
-    if "pdf" not in ctype and not body.startswith(b"%PDF"):
-        return False, f"not a PDF (content-type={ctype or 'unknown'})", False
-
-    name = filename_from_headers_or_url(response, link, stem)
-    target = output_dir / name
-    if skip_existing and target.exists():
-        return True, f"skipped existing {target.name}", False
-
-    if target.exists():
-        i = 2
-        while True:
-            alt = output_dir / f"{target.stem}_{i}{target.suffix}"
-            if not alt.exists():
-                target = alt
-                break
-            i += 1
-
-    target.write_bytes(body)
-    return True, f"saved {target.name} ({target.stat().st_size / 1024:.1f} KB)", False
+def write_report(output_dir: Path, report_file: str, report: dict) -> None:
+    path = output_dir / report_file
+    path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    logger.info("Report written: %s", path)
 
 
 def main() -> int:
     args = parse_args()
+    configure_logging(args.log_level)
+
     output_dir = Path(args.output_dir)
     profile_dir = Path(args.profile_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     profile_dir.mkdir(parents=True, exist_ok=True)
+
+    failures: list[dict[str, object]] = []
 
     with sync_playwright() as p:
         context = p.chromium.launch_persistent_context(
@@ -359,7 +216,7 @@ def main() -> int:
         )
 
         page = context.new_page()
-        print(f"Opening: {args.archive_url}")
+        logger.info("Opening: %s", args.archive_url)
         page.goto(args.archive_url, wait_until="domcontentloaded")
 
         wait_for_user_ready()
@@ -371,27 +228,27 @@ def main() -> int:
         window_id = state.get("credentials", {}).get("windowId", "")
 
         if row_count <= 0:
-            print("No rows found. Confirm you are on the Flatex document archive (classic view).")
+            logger.error("No rows found. Confirm you are on Flatex document archive (classic view).")
             context.close()
             return 1
 
         if not token_id or not window_id:
-            print("Could not extract Flatex token/window credentials from page context.")
-            print("Make sure the archive page is fully loaded and you are logged in.")
+            logger.error("Could not extract Flatex token/window credentials from page context.")
             context.close()
             return 1
 
         start_row = max(1, args.start_row)
         end_row = row_count if args.end_row <= 0 else min(args.end_row, row_count)
         if start_row > end_row:
-            print(f"Invalid range: start-row ({start_row}) > end-row ({end_row})")
+            logger.error("Invalid range: start-row (%s) > end-row (%s)", start_row, end_row)
             context.close()
             return 1
 
-        print(f"Found {row_count} rows. Processing rows {start_row}..{end_row}...")
+        logger.info("Found %s rows. Processing rows %s..%s", row_count, start_row, end_row)
 
         success = 0
         failed = 0
+        skipped = 0
         total = end_row - start_row + 1
 
         for row_index in range(start_row - 1, end_row):
@@ -404,10 +261,10 @@ def main() -> int:
 
             for attempt in range(1, args.retries + 1):
                 try:
-                    # Re-resolve link on every attempt: old links can expire.
                     link = get_row_pdf_link(page, state, row_index)
                 except Exception as exc:
                     error = str(exc)
+                    logger.warning("[%s/%s] link resolve failed attempt %s: %s", row_no, end_row, attempt, error)
                     if attempt < args.retries:
                         time.sleep(2)
                     continue
@@ -427,6 +284,7 @@ def main() -> int:
                     break
 
                 row_msg = msg
+                logger.warning("[%s/%s] attempt %s failed: %s", row_no, end_row, attempt, msg)
                 if retriable and attempt < args.retries:
                     time.sleep(2 * attempt)
                     continue
@@ -434,20 +292,45 @@ def main() -> int:
 
             if not link:
                 failed += 1
-                print(f"[{row_no}/{end_row}] FAIL: could not resolve PDF link ({error})")
+                reason = f"could not resolve PDF link ({error})"
+                logger.error("[%s/%s] FAIL: %s", row_no, end_row, reason)
+                failures.append({"row": row_no, "reason": reason, "url": None})
                 continue
 
             if row_ok:
-                success += 1
-                print(f"[{row_no}/{end_row}] OK: {row_msg}")
+                if row_msg.startswith("skipped existing"):
+                    skipped += 1
+                else:
+                    success += 1
+                logger.info("[%s/%s] OK: %s", row_no, end_row, row_msg)
             else:
                 failed += 1
-                print(f"[{row_no}/{end_row}] FAIL: {row_msg} :: {last_link or link}")
+                url = last_link or link
+                logger.error("[%s/%s] FAIL: %s :: %s", row_no, end_row, row_msg, url)
+                failures.append({"row": row_no, "reason": row_msg, "url": url})
 
-        print(f"\nDone. Downloaded: {success}, failed: {failed}, processed: {total}, output: {output_dir.resolve()}")
+        logger.info(
+            "Done. Downloaded: %s, skipped: %s, failed: %s, processed: %s, output: %s",
+            success,
+            skipped,
+            failed,
+            total,
+            output_dir.resolve(),
+        )
         context.close()
 
-    return 0
+    report = {
+        "total": total,
+        "downloaded": success,
+        "skipped": skipped,
+        "failed": failed,
+        "archive_url": args.archive_url,
+        "output_dir": str(output_dir.resolve()),
+        "failures": failures,
+    }
+    write_report(output_dir, args.report_file, report)
+
+    return 0 if failed == 0 else 1
 
 
 if __name__ == "__main__":
